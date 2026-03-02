@@ -60,6 +60,12 @@ void logWithBar(uint64_t mean)
   Serial.println("]");
 }
 
+void logWithVar(uint64_t mean)
+{
+  Serial.print(">Volume:");
+  Serial.println(mean);
+}
+
 // -----------------------------------------------------------------------------
 
 File audioFile;
@@ -67,6 +73,9 @@ File audioFile;
 int fileIndex = 1;
 
 int32_t i2s_raw_buffer[256];
+int16_t pcm_16_buffer[256]; // Buffer to hold converted 16-bit data
+int num_samples = 0;        // Number of valid samples in the last buffer
+
 uint64_t mean_amplitude = 0; // 64‑bit to avoid overflow when multiplying
 uint64_t sample_count = 0;   // also 64‑bit for the same reason
 unsigned long lastLog = millis();
@@ -78,47 +87,65 @@ void resetThresholdWait()
   return;
 }
 
-/// @brief Check to see if the audio volume is above the threshold
-/// @param default_return The value to return if there is not enough data to make a decision
-/// @return True if the audio level is above the threshold, false if below, or default_return if not enough data
-bool isAboveThreshold(bool default_return = false)
+void readAudioData()
 {
   size_t bytes_read = 0;
+  // Read a chunk of data from the I2S microphone
   esp_err_t result = i2s_read(I2S_NUM_0, i2s_raw_buffer, sizeof(i2s_raw_buffer), &bytes_read, portMAX_DELAY);
+
   if (result == ESP_OK && bytes_read > 0)
   {
-    int num_samples = bytes_read / sizeof(int32_t);
-    uint64_t samplegroup_amplitude = 0;
+    num_samples = bytes_read / sizeof(int32_t);
+
+    // Convert 32-bit I2S data to 16-bit PCM for the WAV file
     for (int i = 0; i < num_samples; i++)
     {
-      // shift the 24‑bit PCM data down to 16‑bit space, like in recordAudio
-      int32_t scaled = i2s_raw_buffer[i] >> 14;
-      samplegroup_amplitude += abs(scaled);
+      // Shift the 24-bit PCM1808 data down to 16-bit space
+      pcm_16_buffer[i] = (int16_t)(i2s_raw_buffer[i] >> 14);
     }
-    // compute new mean using 64‑bit intermediates to avoid overflow
-    uint64_t totalCount = sample_count + (uint64_t)num_samples;
-    mean_amplitude = (mean_amplitude * sample_count + samplegroup_amplitude) / totalCount;
-    sample_count = totalCount;
+  }
+  else
+  {
+    Serial.print("I2S read error: ");
+    Serial.println(result);
+    num_samples = 0;
+  }
+}
 
-    unsigned long now = millis();
-    if (now - lastLog >= LOG_INTERVAL_MS)
-    {
-      lastLog = now;
-      logWithBar(mean_amplitude);
-    }
+/// @brief Check to see if the audio volume is above the threshold
+/// @param default_return The value to return if there is not enough data to make a decision
+/// @param read_new_data If true, will read a new chunk of audio data and update the mean amplitude calculation. If false, will just use the existing mean amplitude.
+/// @return True if the audio level is above the threshold, false if below, or default_return if not enough data
+bool isAboveThreshold(bool default_return = false, bool read_new_data = false)
+{
+  uint64_t samplegroup_amplitude = 0;
+  if (read_new_data)
+  {
+    readAudioData();
+  }
+  for (int i = 0; i < num_samples; i++)
+  {
+    int32_t scaled = (int32_t)pcm_16_buffer[i];
+    samplegroup_amplitude += abs(scaled);
+  }
+  // compute new mean using 64‑bit intermediates to avoid overflow
+  uint64_t totalCount = sample_count + (uint64_t)num_samples;
+  mean_amplitude = (mean_amplitude * sample_count + samplegroup_amplitude) / totalCount;
+  sample_count = totalCount;
 
-    if (sample_count > THRESHOLD_SAMPLE_COUNT)
-    {
-      if (mean_amplitude > audioThreshold)
-      {
-        return true;
-      }
-      else
-      {
-        return false;
-      }
-      resetThresholdWait();
-    }
+  unsigned long now = millis();
+  if (now - lastLog >= LOG_INTERVAL_MS)
+  {
+    lastLog = now;
+    // logWithBar(mean_amplitude);
+    logWithVar(mean_amplitude);
+  }
+
+  if (sample_count > THRESHOLD_SAMPLE_COUNT)
+  {
+    bool isAbove = (mean_amplitude > audioThreshold);
+    resetThresholdWait();
+    return isAbove;
   }
   return default_return;
 }
@@ -165,17 +192,11 @@ void calibrateThreshold(float multiplier = 1.5)
     int collected = 0;
     while (collected < binSamples)
     {
-      size_t bytes_read = 0;
-      esp_err_t res = i2s_read(I2S_NUM_0, buffer, sizeof(buffer), &bytes_read, portMAX_DELAY);
-      if (res == ESP_OK && bytes_read > 0)
+      readAudioData();
+      for (int i = 0; i < num_samples && collected < binSamples; i++)
       {
-        int n = bytes_read / sizeof(int32_t);
-        for (int i = 0; i < n && collected < binSamples; i++)
-        {
-          int32_t scaled = buffer[i] >> 14;
-          sum += abs(scaled);
-          collected++;
-        }
+        sum += abs(pcm_16_buffer[i]);
+        collected++;
       }
     }
     values[b] = sum / binSamples;
@@ -274,47 +295,17 @@ void recordAudio()
 
   uint32_t samples_to_record = SAMPLE_RATE * RECORD_TIME;
   uint32_t samples_written = 0;
-  int32_t i2s_raw_buffer[256]; // Buffer to hold incoming 32-bit data
-  int16_t pcm_16_buffer[256];  // Buffer to hold converted 16-bit data
 
   // variables for meter logging while recording
   unsigned long lastLogRec = millis();
 
   while (samples_written < samples_to_record && isAboveThreshold(true))
   {
-    size_t bytes_read = 0;
+    readAudioData();
 
-    // Read a chunk of data from the I2S microphone
-    esp_err_t result = i2s_read(I2S_NUM_0, i2s_raw_buffer, sizeof(i2s_raw_buffer), &bytes_read, portMAX_DELAY);
-
-    if (result == ESP_OK && bytes_read > 0)
-    {
-      int num_samples = bytes_read / sizeof(int32_t);
-
-      // Convert 32-bit I2S data to 16-bit PCM for the WAV file
-      for (int i = 0; i < num_samples; i++)
-      {
-        // Shift the 24-bit PCM1808 data down to 16-bit space
-        pcm_16_buffer[i] = (int16_t)(i2s_raw_buffer[i] >> 14);
-      }
-
-      // meter calculations
-      uint64_t chunkSum = 0;
-      for (int i = 0; i < num_samples; i++)
-      {
-        chunkSum += abs(pcm_16_buffer[i]);
-      }
-      unsigned long now = millis();
-      if (now - lastLogRec >= LOG_INTERVAL_MS)
-      {
-        lastLogRec = now;
-        logWithBar(chunkSum / num_samples);
-      }
-
-      // Write the 16-bit chunk directly to the SD card
-      audioFile.write((const uint8_t *)pcm_16_buffer, num_samples * sizeof(int16_t));
-      samples_written += num_samples;
-    }
+    // Write the 16-bit chunk directly to the SD card
+    audioFile.write((const uint8_t *)pcm_16_buffer, num_samples * sizeof(int16_t));
+    samples_written += num_samples;
   }
 
   // 5. Finalize the File
@@ -324,7 +315,7 @@ void recordAudio()
   writeWavHeader(audioFile, SAMPLE_RATE, BIT_DEPTH, CHANNELS, samples_written * sizeof(int16_t));
   audioFile.close();
 
-  Serial.println("Saved as 'rec_01.wav'. You can now unplug the SD card and play it on your computer!");
+  Serial.println("Saved as 'rec_" + String(fileIndex) + ".wav'. You can now unplug the SD card and play it on your computer!");
   fileIndex++;
 }
 
@@ -371,7 +362,7 @@ void setup()
   Serial.println(audioThreshold);
   Serial.println("Waiting for silence to start recording...");
   resetThresholdWait();
-  while (isAboveThreshold(true))
+  while (isAboveThreshold(true, true))
   {
     // just wait
   }
@@ -382,7 +373,7 @@ void loop()
   // Wait for the volume to rise above the threshold, logging the current level
   Serial.println("Waiting for sound to start recording...");
   resetThresholdWait();
-  while (!isAboveThreshold())
+  while (!isAboveThreshold(false, true))
   {
     // just wait
   }
